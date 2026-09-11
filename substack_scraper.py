@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 from time import sleep
@@ -17,13 +18,14 @@ from selenium.webdriver.common.by import By
 from webdriver_manager.microsoft import EdgeChromiumDriverManager
 from selenium.webdriver.edge.options import Options as EdgeOptions
 from selenium.webdriver.chrome.service import Service
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from config import EMAIL, PASSWORD
 
 USE_PREMIUM: bool = False  # Set to True if you want to login to Substack and convert paid for posts
 BASE_SUBSTACK_URL: str = "https://www.thefitzwilliam.com/"  # Substack you want to convert to markdown
 BASE_MD_DIR: str = "substack_md_files"  # Name of the directory we'll save the .md essay files
 BASE_HTML_DIR: str = "substack_html_pages"  # Name of the directory we'll save the .html essay files
+BASE_IMAGES_DIR: str = "substack_images"  # Name of the directory we'll save downloaded post images
 HTML_TEMPLATE: str = "author_template.html"  # HTML template to use for the author page
 JSON_DATA_DIR: str = "data"
 NUM_POSTS_TO_SCRAPE: int = 3  # Set to 0 if you want all posts
@@ -69,7 +71,8 @@ def generate_html_file(author_name: str) -> None:
 
 
 class BaseSubstackScraper(ABC):
-    def __init__(self, base_substack_url: str, md_save_dir: str, html_save_dir: str):
+    def __init__(self, base_substack_url: str, md_save_dir: str, html_save_dir: str,
+                 images_save_dir: str = BASE_IMAGES_DIR):
         if not base_substack_url.endswith("/"):
             base_substack_url += "/"
         self.base_substack_url: str = base_substack_url
@@ -79,6 +82,7 @@ class BaseSubstackScraper(ABC):
 
         self.md_save_dir: str = md_save_dir
         self.html_save_dir: str = f"{html_save_dir}/{self.writer_name}"
+        self.images_save_dir: str = f"{images_save_dir}/{self.writer_name}"
 
         if not os.path.exists(md_save_dir):
             os.makedirs(md_save_dir)
@@ -86,6 +90,9 @@ class BaseSubstackScraper(ABC):
         if not os.path.exists(self.html_save_dir):
             os.makedirs(self.html_save_dir)
             print(f"Created html directory {self.html_save_dir}")
+        if not os.path.exists(self.images_save_dir):
+            os.makedirs(self.images_save_dir)
+            print(f"Created images directory {self.images_save_dir}")
 
         self.keywords: List[str] = ["about", "archive", "podcast"]
         self.post_urls: List[str] = self.get_all_post_urls()
@@ -216,6 +223,63 @@ class BaseSubstackScraper(ABC):
             file.write(html_content)
 
     @staticmethod
+    def sanitize_image_filename(name: str) -> str:
+        """
+        Strips querystrings/fragments and replaces characters that are unsafe for filenames.
+        """
+        name = name.split("?")[0].split("#")[0]
+        return re.sub(r'[^A-Za-z0-9._-]', '_', name) or "image"
+
+    def download_image(self, image_url: str, post_slug: str, index: int) -> Optional[str]:
+        """
+        Downloads a single image to this post's local images folder and returns the
+        path (relative to md_save_dir) to use in the rewritten Markdown/HTML.
+        """
+        post_images_dir = os.path.join(self.images_save_dir, post_slug)
+        if not os.path.exists(post_images_dir):
+            os.makedirs(post_images_dir)
+
+        # Substack proxies images through a CDN URL that embeds the real S3 URL as a
+        # percent-encoded path segment; unquote first so we recover the original
+        # filename instead of the whole encoded proxy path.
+        original_name = self.sanitize_image_filename(os.path.basename(unquote(image_url)))
+        if "." not in original_name:
+            original_name += ".png"
+        local_filename = f"{index:02d}_{original_name}"
+        local_path = os.path.join(post_images_dir, local_filename)
+
+        if not os.path.exists(local_path):
+            try:
+                response = requests.get(image_url, timeout=20)
+                response.raise_for_status()
+                with open(local_path, 'wb') as f:
+                    f.write(response.content)
+            except Exception as e:
+                print(f"Failed to download image {image_url}: {e}")
+                return None
+
+        return os.path.relpath(local_path, self.md_save_dir).replace("\\", "/")
+
+    def localize_images(self, content_soup: BeautifulSoup, post_slug: str) -> None:
+        """
+        Downloads every <img> referenced in the post content and rewrites the soup
+        in place to point at the local copy instead of Substack's CDN.
+        """
+        for index, img in enumerate(content_soup.find_all('img')):
+            src = img.get('src')
+            if not src:
+                continue
+            local_rel_path = self.download_image(src, post_slug, index)
+            if local_rel_path is None:
+                continue
+            img['src'] = local_rel_path
+            if img.has_attr('srcset'):
+                del img['srcset']
+            parent_link = img.find_parent('a')
+            if parent_link is not None and parent_link.get('href'):
+                parent_link['href'] = local_rel_path
+
+    @staticmethod
     def get_filename_from_url(url: str, filetype: str = ".md") -> str:
         """
         Gets the filename from the URL (the ending)
@@ -250,7 +314,7 @@ class BaseSubstackScraper(ABC):
 
         return metadata + content
 
-    def extract_post_data(self, soup: BeautifulSoup) -> Tuple[str, str, str, str, str]:
+    def extract_post_data(self, soup: BeautifulSoup, post_slug: str) -> Tuple[str, str, str, str, str]:
         """
         Converts substack post soup to markdown, returns metadata and content
         """
@@ -266,7 +330,9 @@ class BaseSubstackScraper(ABC):
         like_count_element = soup.select_one("a.post-ufi-button .label")
         like_count = like_count_element.text.strip() if like_count_element else "Like count not available"
 
-        content = str(soup.select_one("div.available-content"))
+        content_element = soup.select_one("div.available-content")
+        self.localize_images(content_element, post_slug)
+        content = str(content_element)
         md = self.html_to_md(content)
         md_content = self.combine_metadata_and_content(title, subtitle, date, like_count, md)
         return title, subtitle, like_count, date, md_content
@@ -310,7 +376,8 @@ class BaseSubstackScraper(ABC):
                     if soup is None:
                         total += 1
                         continue
-                    title, subtitle, like_count, date, md = self.extract_post_data(soup)
+                    post_slug = url.rstrip("/").split("/")[-1]
+                    title, subtitle, like_count, date, md = self.extract_post_data(soup, post_slug)
                     self.save_to_file(md_filepath, md)
                     
                     # Convert markdown to HTML and save
