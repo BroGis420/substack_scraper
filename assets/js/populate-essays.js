@@ -2,6 +2,12 @@ let sortLikesAscending = false;
 let sortDatesAscending = false;
 let showHTML = true;
 
+function escapeHtml(value) {
+    const div = document.createElement('div');
+    div.textContent = value ?? '';
+    return div.innerHTML;
+}
+
 function sortEssaysByDate(data) {
     sortDatesAscending = !sortDatesAscending;  // Toggle the sort order
     return data.sort((a, b) => sortDatesAscending
@@ -19,9 +25,9 @@ function populateEssays(data) {
     const essaysContainer = document.getElementById('essays-container');
     const list = data.map(essay => `
         <li>
-            <a href="../${showHTML ? essay.html_link : essay.file_link}" target="_blank">${essay.title}</a>
-            <div class="subtitle">${essay.subtitle}</div>
-            <div class="metadata">${essay.like_count} Likes - ${essay.date}</div>
+            <a href="../${escapeHtml(showHTML ? essay.html_link : essay.file_link)}" target="_blank">${escapeHtml(essay.title)}</a>
+            <div class="subtitle">${escapeHtml(essay.subtitle)}</div>
+            <div class="metadata">${escapeHtml(essay.like_count)} Likes - ${escapeHtml(essay.date)}</div>
         </li>
     `).join('');
     essaysContainer.innerHTML = `<ul>${list}</ul>`;
